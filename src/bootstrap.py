@@ -1,46 +1,42 @@
-# src/bootstrap.py
-import os
+# src/bootstrap.py (Versione Aggiornata)
 import sys
-from src.config import DB_PATH, OPENAI_API_KEY  # Ipotizzando la gestione centralizzata
+
+# Importiamo i percorsi centralizzati
+from src.paths import DB_PATH, POLICY_PATH, ensure_directories_exist
 from src.database import init_db
 
+# AGGIORNAMENTO: Importiamo le variabili e la funzione di diagnostica da config.py
+from src.config import OPENAI_API_KEY, AGENTIC_LOG_PATH, get_config_summary
+
 def check_environment() -> None:
-    """
-    Verifica che tutte le variabili d'ambiente necessarie siano caricate.
-    """
-    print("1. Verifica delle variabili d'ambiente...")
+    print("1. Verifica delle variabili d'ambiente e configurazioni...")
     if not OPENAI_API_KEY:
-        print("[-] ERRORE CRITICO: La variabile OPENAI_API_KEY non è configurata nel file .env!")
+        print("[-] ERRORE CRITICO: La chiave OPENAI_API_KEY non è configurata nel file .env!")
         sys.exit(1)
-    print("[+] Variabili d'ambiente verificate con successo.")
+        
+    # AGGIORNAMENTO: Mostriamo un riepilogo pulito e mascherato all'avvio
+    summary = get_config_summary()
+    print(f"    [+] Modello AI configurato: {summary['OPENAI_MODEL']}")
+    print(f"    [+] API Key caricata: {summary['OPENAI_API_KEY']}")
+    print(f"    [+] Nonce di sicurezza attivo: {summary['NONCE_START'][:15]}...")
 
 def check_required_files() -> None:
-    """
-    Verifica la presenza dei file fisici richiesti dal sistema (DB folder, Policy RAG).
-    """
-    print("2. Verifica dei file richiesti...")
+    print("2. Verifica dei file e delle cartelle richieste...")
     
-    # Assicura la presenza della cartella data/
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    # Crea le cartelle fondamentali di progetto (data/)
+    ensure_directories_exist()
     
-    # Verifica che esista il file per il RAG (STEP 1 del PDF)
-    policy_path = os.path.join(os.path.dirname(db_dir), "data", "policy_supporto.txt")
-    if not os.path.exists(policy_path):
-        print(f"[-] WARNING: Il file delle policy '{policy_path}' non esiste!")
+    # AGGIORNAMENTO: Assicuriamoci che esista anche la cartella per i log se specificata
+    # Peculiarità Python: .parent su un oggetto Path restituisce la cartella che contiene il file.
+    # .mkdir(exist_ok=True) la crea solo se non è già presente.
+    AGENTIC_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    print(f"    [+] Directory log verificata: {AGENTIC_LOG_PATH.parent}")
+    
+    if not POLICY_PATH.exists():
+        print(f"[-] WARNING: Il file delle policy '{POLICY_PATH}' non esiste!")
         print("    Assicurati di crearlo e popolarlo prima di avviare il RAG.")
     else:
-        print("[+] File delle policy rilevato.")
-
-def seed_database_if_empty() -> None:
-    """
-    Inserisce dati di test (es. ordini fake) se il database è appena stato creato.
-    """
-    print("4. Controllo seed del database...")
-    # Qui potrai importare funzioni da src/database per inserire ordini di test
-    # (Ad esempio, per lo STEP 5 ti servirà un ordine > 100€ per testare il breakpoint)
-    pass
+        print("    [+] File delle policy rilevato.")
 
 def run_bootstrap() -> None:
     """
@@ -54,11 +50,8 @@ def run_bootstrap() -> None:
         check_environment()
         check_required_files()
         
-        # 3. Inizializzazione del DB (richiama la tua funzione init_db)
         print("3. Inizializzazione del database...")
         init_db()
-        
-        seed_database_if_empty()
         
         print("=" * 50)
         print("[+] BOOTSTRAP COMPLETATO CON SUCCESSO! Il sistema è pronto.")
