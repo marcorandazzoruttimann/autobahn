@@ -35,6 +35,10 @@ DB_PATH: Path = DATA_DIR / "customer_db.db"
 # 3. File delle policy aziendali (policy_supporto.txt) - STEP 1 del PDF
 POLICY_PATH: Path = DATA_DIR / "policy_supporto.txt"
 
+# COMPATIBILITÀ CHROMA: Definiamo la cartella per la persistenza di ChromaDB
+# che viene puntata da chromadb.PersistentClient
+CHROMA_PATH: Path = DATA_DIR / "chroma"
+
 # 4. File di configurazione ambientale (.env) nella root del progetto
 ENV_PATH: Path = ROOT_DIR / ".env"
 
@@ -52,4 +56,5 @@ def ensure_directories_exist() -> None:
     # Passando 'exist_ok=True', indichiamo a Python di ignorare l'errore se è già presente.
     # 'parents=True' permette di creare ricorsivamente eventuali cartelle genitore mancanti.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
     

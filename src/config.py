@@ -30,7 +30,8 @@ else:
 
 # 1. Configurazione API OpenAI
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+#OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
 
 # 2. Stringhe di Confine Sicuro (Nonce per mitigazione Prompt Injection/Delimitatori)
 NONCE_START: str = os.getenv("NONCE_START", "[SECURE_DATA_BOUNDARY_START_DEFAULT]")

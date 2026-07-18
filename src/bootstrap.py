@@ -4,6 +4,7 @@ import sys
 # Importiamo i percorsi centralizzati
 from src.paths import DB_PATH, POLICY_PATH, ensure_directories_exist
 from src.database import init_db
+from src.rag.chroma_store import get_policy_collection
 
 # AGGIORNAMENTO: Importiamo le variabili e la funzione di diagnostica da config.py
 from src.config import OPENAI_API_KEY, AGENTIC_LOG_PATH, get_config_summary
@@ -34,9 +35,16 @@ def check_required_files() -> None:
     
     if not POLICY_PATH.exists():
         print(f"[-] WARNING: Il file delle policy '{POLICY_PATH}' non esiste!")
-        print("    Assicurati di crearlo e popolarlo prima di avviare il RAG.")
     else:
         print("    [+] File delle policy rilevato.")
+        try:
+            # Peculiarità Python: Inizializziamo a caldo la collection di Chroma durante il bootstrap.
+            # Se il file policy è cambiato o la collection non esiste, lo store si riallineerà
+            # istantaneamente prima che partano gli agenti.
+            get_policy_collection(POLICY_PATH)
+            print("    [+] Vector Store ChromaDB verificato e pronto.")
+        except Exception as e:
+            print(f"[-] WARNING: Errore durante il check a caldo di ChromaDB: {e}")
 
 def run_bootstrap() -> None:
     """
