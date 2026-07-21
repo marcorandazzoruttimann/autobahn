@@ -1,0 +1,24 @@
+---
+description: Aggiungere commenti # nelle parti dense e tecniche del codice
+alwaysApply: true
+---
+
+# Commenti tecnici nel codice
+
+Quando scrivi o modifichi codice in questo progetto:
+
+- Aggiungi **molti commenti** rispetto a uno stile minimale: il progetto è didattico e deve spiegare la logica.
+- Nelle parti **dense e tecniche** (algoritmi, embeddings, SQL, regex, pipeline, serializzazione, gestioni errori non ovvie) usa commenti `#` riga-per-riga o a blocchi brevi che spiegano *perché* e *cosa fa* il pezzo.
+- Scrivi i commenti in **italiano**, allineati allo stile del resto del repo Autobahn.
+- Non commentare l'ovvio (es. `# incrementa i`). Concentrati sulla logica non banale.
+- Applica i commenti anche quando tocchi file già esistenti, non solo sul codice nuovo.
+
+```python
+# ❌ BAD — commento inutile
+i = i + 1  # incrementa i
+
+# ✅ GOOD — spiega la scelta tecnica
+# Convertiamo in float32 per ridurre lo spazio su disco nel BLOB SQLite
+# senza perdere precisione sufficiente per la cosine similarity.
+blob = np.asarray(vec, dtype=np.float32).tobytes()
+```
