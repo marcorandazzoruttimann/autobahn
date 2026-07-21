@@ -61,6 +61,29 @@ CREATE TABLE IF NOT EXISTS final_response (
 );
 """
 
+SQL_CREATE_POLICY_INDEX_META_TABLE = """
+CREATE TABLE IF NOT EXISTS policy_index_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    policy_hash TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+SQL_CREATE_POLICY_CHUNKS_TABLE = """
+CREATE TABLE IF NOT EXISTS policy_chunks (
+    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    policy_hash TEXT NOT NULL
+);
+"""
+
+SQL_CREATE_POLICY_CHUNKS_HASH_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_policy_chunks_hash ON policy_chunks(policy_hash);
+"""
+
 # =====================================================================
 # FUNZIONI DI SEEDING (DATI DI TEST INIZIALI)
 # =====================================================================
@@ -164,7 +187,10 @@ def init_db() -> None:
         SQL_CREATE_ORDINI_INDEX,
         SQL_CREATE_WORKFLOW_STATES_TABLE,
         SQL_CREATE_SECURITY_AUDIT_TABLE,
-        SQL_CREATE_FINAL_RESPONSE_TABLE
+        SQL_CREATE_FINAL_RESPONSE_TABLE,
+        SQL_CREATE_POLICY_INDEX_META_TABLE,
+        SQL_CREATE_POLICY_CHUNKS_TABLE,
+        SQL_CREATE_POLICY_CHUNKS_HASH_INDEX,
     ]
     
     print(f"Inizializzazione del database in corso presso: {DB_PATH}...")

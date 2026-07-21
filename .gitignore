@@ -4,7 +4,6 @@ logs/
 data/tickets.jsonl
 data/triage_system.db
 data/demo_m2_triage.db
-data/chroma/
 __pycache__/
 .pytest_cache/
 *.egg-info/
