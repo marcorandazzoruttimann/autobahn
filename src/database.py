@@ -174,6 +174,56 @@ def get_db_connection() -> Generator[sqlite3.Connection, None, None]:
 
 
 # =====================================================================
+# PERSISTENZA AUDIT SICUREZZA
+# =====================================================================
+
+def insert_security_audit(
+    *,
+    input_testo: str,
+    email_cliente: str | None = None,
+    categoria_attacco: str = "PROMPT_INJECTION",
+    stato_ticket: str = "ATTACK_BLOCKED",
+) -> int:
+    """Registra su ``security_audit`` un input bloccato dal guardrail.
+
+    La traccia persistente dell'attacco è solo SQLite (nessun logger su file):
+    ``guardrails.py`` chiama questa funzione prima di sollevare
+    ``SecurityGuardrailError``, così l'operatore può correlare l'allerta
+    a terminale con ``id_audit``.
+
+    Args:
+        input_testo: Testo email completo (o estratto) che ha attivato il blocco.
+        email_cliente: Mittente se già noto; ``None`` se il guardrail gira prima
+            dell'estrazione dell'indirizzo (es. scan su body grezzo).
+        categoria_attacco: Etichetta derivata dai vettori (es. ``TOOL_HIJACK``,
+            ``POLICY_OVERRIDE``); default allineato allo schema tabella.
+        stato_ticket: Stato fissato a ``ATTACK_BLOCKED`` per input malevoli.
+
+    Returns:
+        ``id_audit`` generato da AUTOINCREMENT (chiave per join e print operativo).
+    """
+    # Parametri posizionali (?): sqlite3 non espone binding nominati; l'ordine
+    # segue le colonne della INSERT, escludendo id_audit e data_rilevamento (DEFAULT).
+    sql_insert_audit = """
+    INSERT INTO security_audit (email_cliente, input_testo, categoria_attacco, stato_ticket)
+    VALUES (?, ?, ?, ?);
+    """
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            sql_insert_audit,
+            (email_cliente, input_testo, categoria_attacco, stato_ticket),
+        )
+        # lastrowid è valorizzato solo dopo execute su una INSERT con INTEGER PRIMARY KEY
+        # AUTOINCREMENT; lo restituiamo al chiamante per includerlo nel ticket dict.
+        return int(cursor.lastrowid)
+        #La proprietà cursor.lastrowid recupera immediatamente dopo l'esecuzione della query (execute) 
+        #quell'ID autogenerato dalla sessione corrente della connessione, 
+        #senza che tu debba fare una successiva SELECT MAX(id) o SELECT id WHERE ....
+
+
+# =====================================================================
 # FUNZIONE DI INIZIALIZZAZIONE
 # =====================================================================
 
