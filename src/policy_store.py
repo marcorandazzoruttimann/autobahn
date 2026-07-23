@@ -1,7 +1,7 @@
 """
 Store vettoriale policy su SQLite + numpy — Lezione 10B.
 
-Persistenza embedding in customer_db.db; scoring in policy_semantic.py.
+Persistenza embedding in customer_db.db; scoring in rag.py.
 
 il db si compone di 2 tabelle: policy_chunks e policy_index_meta. Quest'ultima ha un solo record
 con salvato l'hash256 del file di policy.

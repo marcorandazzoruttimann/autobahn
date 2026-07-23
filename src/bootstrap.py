@@ -3,7 +3,7 @@ import sys
 
 from src.paths import POLICY_PATH, ensure_directories_exist
 from src.database import init_db
-from src.rag.policy_semantic import warm_policy_index_from_file
+from src.rag import warm_policy_index_from_file
 from src.config import OPENAI_API_KEY, AGENTIC_LOG_PATH, get_config_summary
 
 

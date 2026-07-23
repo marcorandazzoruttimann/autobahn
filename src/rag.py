@@ -13,10 +13,11 @@ from typing import Any
 import numpy as np
 
 from src.client import get_client
-from src.rag.policy_store import (
+from src.policy_store import (
     ensure_policy_indexed,
     get_stored_policy_hash,
     load_policy_chunks,
+    policy_content_hash,
     reset_policy_store,
 )
 
@@ -127,13 +128,8 @@ def warm_policy_index_from_file(policy_path: Path) -> None:
     if not policy_path.exists():
         return
 
-    from src.rag.policy_store import (
-        ensure_policy_indexed,
-        get_stored_policy_hash,
-        load_policy_chunks,
-        policy_content_hash,
-    )
-
+    # Stessi helper dello store: confrontiamo hash file vs meta SQLite
+    # per decidere se l'indice è già allineato o va ricostruito.
     current_hash = policy_content_hash(policy_path)
     if get_stored_policy_hash() == current_hash and load_policy_chunks(current_hash):
         return #se il policy hash in tabella e i chunk in tabella hanno questo hash allora ok
