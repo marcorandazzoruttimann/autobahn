@@ -19,7 +19,8 @@ from typing import Any
 
 from src.client import MODEL, get_client
 from src.config import NONCE_END, NONCE_START
-from src.errors import ResolverError, TriageError
+from src.errors import ResolverError, SecurityGuardrailError, TriageError
+from src.guardrails import sanitize_email_input
 from src.tools import OPENAI_TOOLS, execute_tool
 
 # Lingue ammesse nel contratto hand-off A1 → A2 (piano STEP 3).
@@ -700,3 +701,69 @@ def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, An
     raise ResolverError(
         f"Resolver fallito dopo {_MAX_TURNI_RESOLVER} turni: {ultimo_errore}"
     ) from ultimo_errore
+
+
+# =====================================================================
+# ORCHESTRATORE — elabora_email (pipeline lineare / deterministica)
+# =====================================================================
+
+
+def elabora_email(testo: str) -> dict[str, Any]:
+    """Orchestratore STEP 3: esegue sempre la stessa sequenza fissa.
+
+    Grafo (nessun routing dinamico, niente CrewAI/AutoGen/LangGraph)::
+
+        Guardrail → A1 Triage → Hand-off (dict in memoria) → A2 Resolver → JSON
+
+    Args:
+        testo: Corpo grezzo dell'email cliente (pre-nonce; i confini vengono
+            applicati dentro A1/A2, non qui).
+
+    Returns:
+        - Dict output Resolver (``soluzione_proposta``, ``priorita``, …) se
+          la pipeline completa correttamente.
+        - Dict ``ticket`` ATTACK_BLOCKED se il guardrail blocca l'input
+          (stesso payload allegato a ``SecurityGuardrailError``).
+
+    Note:
+        Il nonce sul testo utente è responsabilità degli agenti
+        (``wrap_user_text_with_nonce``), non dell'orchestratore: qui
+        orchestrazione pura, zero chiamate LLM dirette.
+    """
+    print("[PIPELINE] Avvio elabora_email (Guardrail → Triage → Hand-off → Resolver).")
+
+    # --- Step 1: Guardrail deterministico (regex) ---
+    # sanitize_email_input restituisce True se ok; se malevolo:
+    #   1) scrive su security_audit
+    #   2) alza SecurityGuardrailError con ticket pronto
+    # Catturiamo QUI così main non deve conoscere il contratto di eccezione
+    # e gli agenti LLM non vengono mai invocati su input ATTACK_BLOCKED.
+    try:
+        sanitize_email_input(testo)
+    except SecurityGuardrailError as exc:
+        # Interruzione soft: stampiamo il ticket e lo restituiamo come dict.
+        # Nessun [HAND-OFF] verso A2 — la pipeline si ferma al guardrail.
+        print(
+            "[PIPELINE] Interrotta da guardrail | "
+            f"stato={exc.ticket.get('stato_ticket')!r} | "
+            f"id_audit={exc.ticket.get('id_audit')!r}"
+        )
+        # Stesso tag [OUTPUT] del path felice: la demo in main può trattare
+        # uniformemente qualsiasi dict restituito da elabora_email.
+        print(f"[OUTPUT] {json.dumps(exc.ticket, ensure_ascii=False)}")
+        return exc.ticket
+
+    # --- Step 2: Agente 1 Triage (1 call JSON, zero tools/DB) ---
+    triage = run_triage_agent(testo)
+
+    # --- Step 3: Hand-off in memoria (dict), solo print a terminale ---
+    # Non persistere su file: il piano STEP 3 vuole hand-off volatile
+    # passato direttamente a run_resolver_agent.
+    print(f"[HAND-OFF] {json.dumps(triage, ensure_ascii=False)}")
+
+    # --- Step 4: Agente 2 Resolver (ReAct tool calling → JSON finale) ---
+    # A2 riceve sia il JSON A1 sia l'email originale (con nonce interno).
+    risultato = run_resolver_agent(triage, testo)
+
+    print("[PIPELINE] elabora_email completata con successo.")
+    return risultato
