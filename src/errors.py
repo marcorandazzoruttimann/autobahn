@@ -1,4 +1,4 @@
-"""Eccezioni di dominio per il triage Autobahn."""
+"""Eccezioni di dominio per il triage / resolver Autobahn."""
 
 from __future__ import annotations
 
@@ -19,3 +19,11 @@ class SecurityGuardrailError(TriageError):
         super().__init__(message)
         # Payload serializzabile costruito da guardrails.py al momento del blocco.
         self.ticket = ticket
+
+
+class ResolverError(TriageError):
+    """Errore nell'Agente 2 Resolver (JSON finale malformato, cap turni, ecc.).
+
+    Estende ``TriageError`` così l'orchestratore può catturare entrambi con un
+    solo ``except TriageError`` se vuole interrompere l'intera pipeline.
+    """
