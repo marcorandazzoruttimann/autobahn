@@ -1,4 +1,4 @@
-"""Orchestrazione STEP 3 — Agente 1 Triage + Agente 2 Resolver (ReAct).
+"""Orchestrazione STEP 3/4 — Agente 1 Triage + Agente 2 Resolver (ReAct).
 
 Pipeline lineare (orchestratore separato in ``elabora_email``):
   Guardrail → A1 Triage (1 call JSON) → Hand-off → A2 Resolver (tool loop) → JSON.
@@ -9,6 +9,8 @@ Nessun tool, nessun accesso a DB/RAG: estrae mittente, lingua, riassunto e
 
 Agente 2: loop **ReAct** con function calling OpenAI nativo
 (``get_order_status``, ``get_support_policy``) fino al JSON finale di risposta.
+Prima di ogni call LLM applica ``prune_resolver_messages`` (system + user0
++ ultimi 4, con estensione anti-400 se la coda taglia un round tool a metà).
 """
 
 from __future__ import annotations
@@ -51,6 +53,10 @@ _CAMPI_OBBLIGATORI_RESOLVER = (
     "soluzione_proposta",
     "priorita",
 )
+
+# Quanti messaggi *dopo* system+user0 tenere nella coda (piano STEP 4).
+# Valore fisso dal PDF: ultimi 4 scambi (assistant / tool / user di correzione).
+_PRUNE_CODA_MAX = 4
 
 def _build_system_prompt_triage() -> str:
     """Costruisce il system prompt A1 con i nonce reali da ``config``.
@@ -536,6 +542,79 @@ def _normalizza_e_valida_resolver(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def prune_resolver_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Riduce la cronologia A2: system + user0 + ultimi N messaggi (sicuri).
+
+    Regola PDF (STEP 4):
+      - tieni sempre ``messages[0]`` (system originale)
+      - tieni sempre ``messages[1]`` (user iniziale = hand-off + email)
+      - dei messaggi successivi, tieni solo gli **ultimi** ``_PRUNE_CODA_MAX``
+
+    Vincolo OpenAI: un ``role=tool`` deve seguire l'``assistant`` con lo stesso
+    ``tool_call_id``. Se la coda di 4 inizia a metà di un round tool (primo
+    elemento ``role=tool``), l'API risponde HTTP 400. Mitigazione: estendiamo
+    la coda *all'indietro* in ``messages[2:]`` fino a includere l'assistant
+    con ``tool_calls`` che apre quel round — anche se così la coda supera 4.
+
+    Non muta la lista in ingresso: restituisce una nuova lista (la cronologia
+    "vera" in ``run_resolver_agent`` continua a crescere; qui tagliamo solo
+    ciò che mandiamo all'API a ogni turno).
+    """
+    n_prima = len(messages)
+
+    # Prefisso troppo corto: niente da potare (es. solo system, o system+user).
+    if n_prima <= 2:
+        print(
+            f"[PRUNE] messages invariati: len={n_prima} "
+            f"(serve almeno system+user+1 per potare)"
+        )
+        return list(messages)
+
+    system = messages[0]
+    user0 = messages[1]
+    # Coda candidata: tutto ciò che viene *dopo* il prefisso fisso.
+    resto = messages[2:]
+    # Slice degli ultimi N: se resto ha ≤ N elementi, prendiamo tutto -> perchè ancora non cè da potare 
+    coda = resto[-_PRUNE_CODA_MAX:]
+
+    # --- Sicurezza tool_call (anti-400) ---
+    # Se la coda inizia con un messaggio tool, abbiamo tagliato via l'assistant
+    # che aveva emesso i tool_calls. OpenAI richiede quella coppia contigua.
+    # Scoriamo all'indietro in ``resto`` partendo dall'indice appena prima
+    # dell'inizio della coda corrente, finché non troviamo un assistant con
+    # ``tool_calls`` (o esauriamo il resto).
+    if coda and coda[0].get("role") == "tool":
+        # Indice in ``resto`` del primo elemento della coda attuale.
+        # Es.: resto len=7, coda=ultimi 4 → start_idx = 7-4 = 3.
+        start_idx = len(resto) - len(coda)
+        # Camminiamo all'indietro: i-1, i-2, … includendo ogni messaggio
+        # nella nuova coda finché non agganciamo l'assistant apritore.
+        i = start_idx - 1
+        while i >= 0:
+            candidato = resto[i]
+            # Prependiamo: ricostruiamo la coda estesa dall'inizio del round.
+            coda = [candidato] + coda
+            # Assistant con tool_calls = inizio legittimo del round function calling.
+            if (
+                candidato.get("role") == "assistant"
+                and candidato.get("tool_calls")
+            ):
+                break
+            i -= 1
+        # Se i < 0 senza trovare assistant: lasciamo la coda estesa al massimo
+        # disponibile (meglio un contesto lungo che un 400). Caso raro con
+        # cronologia corrotta; in uso normale l'assistant c'è sempre prima.
+
+    pruned = [system, user0] + coda
+    n_dopo = len(pruned)
+    # Diagnostica a terminale (niente file logger — piano STEP 4).
+    print(
+        f"[PRUNE] messages {n_prima} → {n_dopo} "
+        f"(prefisso=2, coda={len(coda)}, max_coda={_PRUNE_CODA_MAX})"
+    )
+    return pruned
+
+
 def _chiama_llm_resolver(
     messages: list[dict[str, Any]],
     *,
@@ -570,11 +649,12 @@ def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, An
     """Agente 2 — Resolver ReAct: tool calling OpenAI → JSON risposta + priorità.
 
     Loop deterministico (max ``_MAX_TURNI_RESOLVER`` chiamate LLM):
-      1. LLM riceve cronologia + schema tools
-      2. Se emette ``tool_calls`` → eseguiamo Python via ``execute_tool`` e
+      1. Prune della cronologia (system+user0+ultimi 4, anti-400 tool)
+      2. LLM riceve cronologia ridotta + schema tools
+      3. Se emette ``tool_calls`` → eseguiamo Python via ``execute_tool`` e
          rimandiamo observation (``role=tool``)
-      3. Se emette content → parsamo/validiamo il JSON finale
-      4. All'ultimo turno forziamo ``tool_choice=none`` + json_object
+      4. Se emette content → parsamo/validiamo il JSON finale
+      5. All'ultimo turno forziamo ``tool_choice=none`` + json_object
 
     Args:
         triage: Hand-off A1 già validato (email_mittente, lingua, riassunto,
@@ -593,6 +673,10 @@ def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, An
     # ``triage`` è tipizzato dict[str, Any]: A1 lo valida già; niente check runtime.
 
     # Cronologia chat: system + user iniziale; i turni appendono assistant/tool.
+    # Questa lista *completa* cresce a ogni turno; il prune produce una vista
+    # ridotta solo per la request OpenAI (non sovrascriviamo ``messages``).
+    # ovvero messages è un backup della lista messaggi originale senza pruning che non cancelliamo
+    # prima di chiamare llm ripetiamo ogni volta il pruning 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _build_system_prompt_resolver()},
         {"role": "user", "content": _build_user_prompt_resolver(triage, testo_email)},
@@ -608,7 +692,13 @@ def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, An
             f"(tools={'on' if consenti_tools else 'off'})..."
         )
 
-        response = _chiama_llm_resolver(messages, consenti_tools=consenti_tools)
+        # Prune *prima* della call: ogni request riceve già il contesto ridotto
+        # (system + user0 + coda sicura). La cronologia locale resta integra
+        # così i turni successivi possono ancora appendere assistant/tool.
+        messages_per_api = prune_resolver_messages(messages)
+        response = _chiama_llm_resolver(
+            messages_per_api, consenti_tools=consenti_tools
+        )
         message = response.choices[0].message
         tool_calls = getattr(message, "tool_calls", None) or []
 
