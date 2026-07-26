@@ -11,12 +11,18 @@ Agente 2: loop **ReAct** con function calling OpenAI nativo
 (``get_order_status``, ``get_support_policy``) fino al JSON finale di risposta.
 Prima di ogni call LLM applica ``prune_resolver_messages`` (system + user0
 + ultimi 4, con estensione anti-400 se la coda taglia un round tool a metà).
+
+Telemetria STEP 4: ogni ``chat.completions.create`` (A1 + A2) accumula
+``response.usage`` in un ``TelemetriaLlm``; l'orchestratore misura latenza
+dopo il guardrail e calcola il costo con i coefficienti PDF.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from src.client import MODEL, get_client
@@ -57,6 +63,92 @@ _CAMPI_OBBLIGATORI_RESOLVER = (
 # Quanti messaggi *dopo* system+user0 tenere nella coda (piano STEP 4).
 # Valore fisso dal PDF: ultimi 4 scambi (assistant / tool / user di correzione).
 _PRUNE_CODA_MAX = 4
+
+# ---------------------------------------------------------------------
+# TELEMETRIA STEP 4 — coefficienti costo (equazioni PDF, non prezzi reali)
+# ---------------------------------------------------------------------
+# Il brief didattico fissa questi moltiplicatori indipendentemente dal
+# listino OpenAI del modello in uso: così i risultati della demo restano
+# riproducibili e confrontabili con il PDF del corso.
+COSTO_PER_TOKEN_IN = 0.000005
+COSTO_PER_TOKEN_OUT = 0.000015
+
+
+@dataclass
+class TelemetriaLlm:
+    """Accumulatore mutabile di token prompt/completion su più call LLM.
+
+    Un'unica istanza viene tipicamente creata in ``elabora_email`` e passata
+    ad A1 e A2: così Triage + tutti i turni Resolver confluiscono negli
+    stessi contatori senza dover sommare dict a mano nell'orchestratore.
+    """
+
+    # Contatori cumulativi (A1 + N turni A2). Partono da 0: se usage manca
+    # restiamo a zero anziché fallire la pipeline.
+    token_input: int = 0
+    token_output: int = 0
+    # Quante response.usage erano None: utile in diagnostica (non persistito).
+    usage_mancanti: int = field(default=0, repr=False)
+
+    def accumula_usage(self, usage: Any) -> None: #in usage gli passo response.usage da llm
+        """Somma ``prompt_tokens`` / ``completion_tokens`` da ``response.usage``.
+
+        OpenAI può restituire ``usage is None`` (es. alcuni proxy/mock): in
+        quel caso trattiamo i token come 0 e stampiamo un warning, così il
+        costo resta definito e la pipeline non esplode.
+        """
+        if usage is None: #se usage is None vuol dire che da llm era un mock o cmq vhiamata non veritiera
+            self.usage_mancanti += 1
+            print(
+                "[TELEMETRIA] WARNING: response.usage is None — "
+                "token_input/token_output di questa call contati come 0."
+            )
+            return
+
+        # getattr con default 0: difende da oggetti usage parziali/mock
+        # che espongono solo uno dei due campi.
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0) #token ingresso (domanda)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0) #token uscita (di risposta)
+        self.token_input += prompt
+        self.token_output += completion
+
+    def costo_calcolato(self) -> float:
+        """Costo PDF: (token_in × 5e-6) + (token_out × 1.5e-5)."""
+        return calcola_costo(self.token_input, self.token_output)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Snapshot dei campi telemetria utili a DB / dict restituito."""
+        return {
+            "token_input": self.token_input,
+            "token_output": self.token_output,
+            "costo_calcolato": self.costo_calcolato(),
+        }
+
+
+def calcola_costo(token_input: int, token_output: int) -> float:
+    """Applica l'equazione costo del PDF ai totali token accumulati.
+
+    Non usa i prezzi reali OpenAI del modello: i coefficienti sono quelli
+    didattici fissati in ``COSTO_PER_TOKEN_*``.
+    """
+    # Somma lineare: input e output hanno prezzi unitari diversi (out > in
+    # perché la generazione costa più del prompt nel modello economico PDF).
+    return (token_input * COSTO_PER_TOKEN_IN) + (token_output * COSTO_PER_TOKEN_OUT)
+
+
+def avvia_timer_latenza() -> float:
+    """Marca ``t0`` per la latenza end-to-end del path felice (post-guardrail).
+
+    Usiamo ``time.time()`` (wall-clock) come da piano: sufficiente per la
+    demo; non serve monotonic perché non confrontiamo intervalli tra reboot.
+    """
+    return time.time()
+
+
+def misura_latenza_secondi(t0: float) -> float:
+    """Delta secondi da ``t0`` (tipicamente subito prima della scrittura DB)."""
+    return time.time() - t0
+
 
 def _build_system_prompt_triage() -> str:
     """Costruisce il system prompt A1 con i nonce reali da ``config``.
@@ -278,11 +370,17 @@ def _normalizza_e_valida_triage(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _chiama_llm_triage(testo_con_nonce: str) -> str:
+def _chiama_llm_triage(
+    testo_con_nonce: str,
+    telemetria: TelemetriaLlm | None = None,
+) -> str:
     """Esegue la singola chiamata Chat Completions per il Triage Analyst.
 
     ``response_format`` forza un oggetto JSON (non array/testo libero),
     riducendo i fallimenti di parse senza introdurre tool calling.
+
+    Se ``telemetria`` è passato, accumula ``response.usage`` (token in/out)
+    nell'oggetto condiviso con il Resolver / orchestratore.
     """
     client = get_client()
     response = client.chat.completions.create(
@@ -306,6 +404,11 @@ def _chiama_llm_triage(testo_con_nonce: str) -> str:
         ],
     )
 
+    # Accumulo usage *prima* di toccare content: anche se content è None
+    # vogliamo comunque contabilizzare i token spesi su questa call.
+    if telemetria is not None:
+        telemetria.accumula_usage(response.usage)
+
     # Difesa: content può essere None se il provider taglia o rifiuta l'output.
     content = response.choices[0].message.content
     if content is None:
@@ -313,11 +416,16 @@ def _chiama_llm_triage(testo_con_nonce: str) -> str:
     return content
 
 
-def run_triage_agent(testo: str) -> dict[str, Any]:
+def run_triage_agent(
+    testo: str,
+    telemetria: TelemetriaLlm | None = None,
+) -> dict[str, Any]:
     """Agente 1 — Triage: 1 chiamata LLM (con eventuale retry) → JSON hand-off.
 
     Args:
         testo: Corpo email già sanificato dal guardrail (nessun DB/RAG qui).
+        telemetria: Accumulatore opzionale condiviso con A2; ogni call
+            (incluso il retry di parse) somma i propri token.
 
     Returns:
         Dict con ``email_mittente``, ``lingua``, ``riassunto``,
@@ -337,7 +445,9 @@ def run_triage_agent(testo: str) -> dict[str, Any]:
     for tentativo in range(1, _MAX_TENTATIVI_TRIAGE + 1):
         try:
             print(f"[TRIAGE] Chiamata LLM tentativo {tentativo}/{_MAX_TENTATIVI_TRIAGE}...")
-            raw = _chiama_llm_triage(testo_protetto)
+            # Passiamo lo stesso TelemetriaLlm: un retry fallito conta comunque
+            # nei token (è costo reale della pipeline).
+            raw = _chiama_llm_triage(testo_protetto, telemetria=telemetria)
             print(f"[TRIAGE] Raw LLM: {raw[:300]!r}")
 
             # Parse → validazione contratto: entrambi possono fallire e triggerare retry.
@@ -619,6 +729,7 @@ def _chiama_llm_resolver(
     messages: list[dict[str, Any]],
     *,
     consenti_tools: bool,
+    telemetria: TelemetriaLlm | None = None,
 ) -> Any:
     """Una chiamata Chat Completions per il Resolver (con o senza tools).
 
@@ -626,6 +737,9 @@ def _chiama_llm_resolver(
     passa lo schema tools e attiva ``response_format=json_object``: così
     evitiamo combinazioni API ambigue (tools + json_object) e chiudiamo
     con un oggetto strutturato rispettando l'hard-cap.
+
+    ``telemetria`` (se presente) riceve ``response.usage`` di *questa* call;
+    il loop A2 lo passa a ogni turno così i token si sommano.
     """
     client = get_client()
     kwargs: dict[str, Any] = {
@@ -642,10 +756,18 @@ def _chiama_llm_resolver(
         # Solo JSON finale: niente function calling su questo turno.
         kwargs["response_format"] = {"type": "json_object"}
 
-    return client.chat.completions.create(**kwargs)
+    response = client.chat.completions.create(**kwargs)
+    # Accumulo subito dopo la create: indipendente dal ramo tool_calls/content.
+    if telemetria is not None:
+        telemetria.accumula_usage(response.usage)
+    return response
 
 
-def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, Any]:
+def run_resolver_agent(
+    triage: dict[str, Any],
+    testo_email: str,
+    telemetria: TelemetriaLlm | None = None,
+) -> dict[str, Any]:
     """Agente 2 — Resolver ReAct: tool calling OpenAI → JSON risposta + priorità.
 
     Loop deterministico (max ``_MAX_TURNI_RESOLVER`` chiamate LLM):
@@ -660,6 +782,8 @@ def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, An
         triage: Hand-off A1 già validato (email_mittente, lingua, riassunto,
             id_ordine_sospetto).
         testo_email: Corpo email originale (sarà wrappato con nonce nel prompt).
+        telemetria: Accumulator opzionale condiviso con A1; ogni turno LLM
+            somma i propri token (anche turni di retry JSON).
 
     Returns:
         Dict con ``soluzione_proposta``, ``priorita``, ``id_ordine``,
@@ -697,7 +821,9 @@ def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, An
         # così i turni successivi possono ancora appendere assistant/tool.
         messages_per_api = prune_resolver_messages(messages)
         response = _chiama_llm_resolver(
-            messages_per_api, consenti_tools=consenti_tools
+            messages_per_api,
+            consenti_tools=consenti_tools,
+            telemetria=telemetria,
         )
         message = response.choices[0].message
         tool_calls = getattr(message, "tool_calls", None) or []
@@ -799,21 +925,27 @@ def run_resolver_agent(triage: dict[str, Any], testo_email: str) -> dict[str, An
 
 
 def elabora_email(testo: str) -> dict[str, Any]:
-    """Orchestratore STEP 3: esegue sempre la stessa sequenza fissa.
+    """Orchestratore STEP 3/4: esegue sempre la stessa sequenza fissa.
 
     Grafo (nessun routing dinamico, niente CrewAI/AutoGen/LangGraph)::
 
         Guardrail → A1 Triage → Hand-off (dict in memoria) → A2 Resolver → JSON
+
+    Sul path felice misura anche telemetria (token A1+A2, costo PDF, latenza
+    post-guardrail) e la arricchisce sul dict restituito. La persistenza su
+    ``final_response`` è demandata allo step DB successivo.
 
     Args:
         testo: Corpo grezzo dell'email cliente (pre-nonce; i confini vengono
             applicati dentro A1/A2, non qui).
 
     Returns:
-        - Dict output Resolver (``soluzione_proposta``, ``priorita``, …) se
+        - Dict output Resolver + chiavi telemetria (``token_input``,
+          ``token_output``, ``costo_calcolato``, ``latenza_secondi``) se
           la pipeline completa correttamente.
         - Dict ``ticket`` ATTACK_BLOCKED se il guardrail blocca l'input
-          (stesso payload allegato a ``SecurityGuardrailError``).
+          (stesso payload allegato a ``SecurityGuardrailError``; nessuna
+          telemetria LLM — il timer non parte).
 
     Note:
         Il nonce sul testo utente è responsabilità degli agenti
@@ -843,8 +975,15 @@ def elabora_email(testo: str) -> dict[str, Any]:
         print(f"[OUTPUT] {json.dumps(exc.ticket, ensure_ascii=False)}")
         return exc.ticket
 
+    # --- Telemetria: timer SOLO dopo guardrail ok ---
+    # I ticket ATTACK_BLOCKED non devono gonfiare latenza_secondi con lavoro
+    # LLM che non avviene; t0 parte qui, subito prima di A1.
+    t0 = avvia_timer_latenza()
+    # Accumulator condiviso A1+A2: una sola istanza, mutate in-place dalle call.
+    telemetria = TelemetriaLlm()
+
     # --- Step 2: Agente 1 Triage (1 call JSON, zero tools/DB) ---
-    triage = run_triage_agent(testo)
+    triage = run_triage_agent(testo, telemetria=telemetria)
 
     # --- Step 3: Hand-off in memoria (dict), solo print a terminale ---
     # Non persistere su file: il piano STEP 3 vuole hand-off volatile
@@ -853,7 +992,25 @@ def elabora_email(testo: str) -> dict[str, Any]:
 
     # --- Step 4: Agente 2 Resolver (ReAct tool calling → JSON finale) ---
     # A2 riceve sia il JSON A1 sia l'email originale (con nonce interno).
-    risultato = run_resolver_agent(triage, testo)
+    # Stesso ``telemetria``: i turni Resolver si sommano ai token Triage.
+    risultato = run_resolver_agent(triage, testo, telemetria=telemetria)
+
+    # --- Step 5: chiudi telemetria (costo + latenza) e arricchisci il dict ---
+    # La scrittura SQLite (insert_final_response) arriverà nello step DB;
+    # qui esponiamo già i campi per la demo in main e per il futuro INSERT.
+    latenza = misura_latenza_secondi(t0)
+    risultato = {
+        **risultato,
+        **telemetria.as_dict(),
+        "latenza_secondi": latenza,
+    }
+    print(
+        "[TELEMETRIA] "
+        f"tokens_in={risultato['token_input']} "
+        f"tokens_out={risultato['token_output']} "
+        f"costo={risultato['costo_calcolato']:.6f} "
+        f"latenza={latenza:.3f}s"
+    )
 
     print("[PIPELINE] elabora_email completata con successo.")
     return risultato
