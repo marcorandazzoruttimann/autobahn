@@ -27,6 +27,7 @@ from typing import Any
 
 from src.client import MODEL, get_client
 from src.config import NONCE_END, NONCE_START
+from src.database import insert_final_response
 from src.errors import ResolverError, SecurityGuardrailError, TriageError
 from src.guardrails import sanitize_email_input
 from src.tools import OPENAI_TOOLS, execute_tool
@@ -929,11 +930,12 @@ def elabora_email(testo: str) -> dict[str, Any]:
 
     Grafo (nessun routing dinamico, niente CrewAI/AutoGen/LangGraph)::
 
-        Guardrail → A1 Triage → Hand-off (dict in memoria) → A2 Resolver → JSON
+        Guardrail → A1 Triage → Hand-off (dict in memoria) → A2 Resolver
+        → telemetria + INSERT ``final_response``
 
-    Sul path felice misura anche telemetria (token A1+A2, costo PDF, latenza
-    post-guardrail) e la arricchisce sul dict restituito. La persistenza su
-    ``final_response`` è demandata allo step DB successivo.
+    Sul path felice misura telemetria (token A1+A2, costo PDF, latenza
+    post-guardrail), persiste su SQLite e arricchisce il dict restituito.
+    I ticket ``ATTACK_BLOCKED`` non toccano ``final_response``.
 
     Args:
         testo: Corpo grezzo dell'email cliente (pre-nonce; i confini vengono
@@ -941,11 +943,11 @@ def elabora_email(testo: str) -> dict[str, Any]:
 
     Returns:
         - Dict output Resolver + chiavi telemetria (``token_input``,
-          ``token_output``, ``costo_calcolato``, ``latenza_secondi``) se
-          la pipeline completa correttamente.
+          ``token_output``, ``costo_calcolato``, ``latenza_secondi``,
+          ``id_risposta``) se la pipeline completa correttamente.
         - Dict ``ticket`` ATTACK_BLOCKED se il guardrail blocca l'input
           (stesso payload allegato a ``SecurityGuardrailError``; nessuna
-          telemetria LLM — il timer non parte).
+          telemetria LLM — il timer non parte; nessun INSERT finale).
 
     Note:
         Il nonce sul testo utente è responsabilità degli agenti
@@ -965,6 +967,8 @@ def elabora_email(testo: str) -> dict[str, Any]:
     except SecurityGuardrailError as exc:
         # Interruzione soft: stampiamo il ticket e lo restituiamo come dict.
         # Nessun [HAND-OFF] verso A2 — la pipeline si ferma al guardrail.
+        # Nessun insert_final_response: solo security_audit (già scritto
+        # dentro sanitize_email_input prima dell'eccezione).
         print(
             "[PIPELINE] Interrotta da guardrail | "
             f"stato={exc.ticket.get('stato_ticket')!r} | "
@@ -995,21 +999,44 @@ def elabora_email(testo: str) -> dict[str, Any]:
     # Stesso ``telemetria``: i turni Resolver si sommano ai token Triage.
     risultato = run_resolver_agent(triage, testo, telemetria=telemetria)
 
-    # --- Step 5: chiudi telemetria (costo + latenza) e arricchisci il dict ---
-    # La scrittura SQLite (insert_final_response) arriverà nello step DB;
-    # qui esponiamo già i campi per la demo in main e per il futuro INSERT.
+    # --- Step 5: chiudi telemetria (costo + latenza) ---
+    # Misuriamo *prima* dell'INSERT così latenza_secondi riflette il lavoro
+    # LLM (A1+A2), non il round-trip SQLite (trascurabile ma fuori scope PDF).
     latenza = misura_latenza_secondi(t0)
+    costo = telemetria.costo_calcolato()
+
+    # --- Step 6: persistenza SQLite solo sul path felice ---
+    # Mapping colonne ← fonti (piano STEP 4):
+    #   id_ordine         ← JSON A2 (NULL se assente o non in ordini)
+    #   email_cliente     ← hand-off A1 email_mittente (fallback in DB)
+    #   risposta_generata ← soluzione_proposta
+    #   priorita_ticket   ← priorita A2
+    #   token_* / costo / latenza ← accumulo telemetria + timer
+    id_risposta = insert_final_response(
+        id_ordine=risultato.get("id_ordine"),
+        email_cliente=str(triage.get("email_mittente") or ""),
+        risposta_generata=str(risultato["soluzione_proposta"]),
+        priorita_ticket=str(risultato["priorita"]),
+        token_input=telemetria.token_input,
+        token_output=telemetria.token_output,
+        costo_calcolato=costo,
+        latenza_secondi=latenza,
+    )
+
+    # Arricchiamo il dict per la demo in main (stesse chiavi della riga DB).
     risultato = {
         **risultato,
         **telemetria.as_dict(),
         "latenza_secondi": latenza,
+        "id_risposta": id_risposta,
     }
     print(
         "[TELEMETRIA] "
         f"tokens_in={risultato['token_input']} "
         f"tokens_out={risultato['token_output']} "
         f"costo={risultato['costo_calcolato']:.6f} "
-        f"latenza={latenza:.3f}s"
+        f"latenza={latenza:.3f}s "
+        f"id_risposta={id_risposta}"
     )
 
     print("[PIPELINE] elabora_email completata con successo.")

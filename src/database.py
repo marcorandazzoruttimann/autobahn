@@ -224,6 +224,117 @@ def insert_security_audit(
 
 
 # =====================================================================
+# PERSISTENZA RISPOSTA FINALE + TELEMETRIA
+# =====================================================================
+
+# Fallback NOT NULL per email_cliente quando A1 non estrae un mittente:
+# lo schema richiede VARCHAR NOT NULL, ma l'LLM può restituire "".
+_EMAIL_CLIENTE_FALLBACK = "sconosciuto@local"
+
+
+def insert_final_response(
+    *,
+    email_cliente: str,
+    risposta_generata: str,
+    priorita_ticket: str,
+    token_input: int,
+    token_output: int,
+    costo_calcolato: float,
+    latenza_secondi: float,
+    id_ordine: str | None = None,
+) -> int:
+    """Persiste su ``final_response`` la risposta A2 e la telemetria STEP 4.
+
+    Chiamata solo dal path felice di ``elabora_email`` (mai su
+    ``ATTACK_BLOCKED``): così i ticket bloccati dal guardrail non sporcano
+    la tabella delle risposte operative.
+
+    Vincolo FK su ``id_ordine`` → ``ordini(id_ordine)``: se l'ID non esiste
+    (allucinazione LLM, ordine assente, o ``None``), inseriamo ``NULL``
+    invece di far fallire l'INSERT con IntegrityError. La risposta resta
+    comunque tracciata con token/costo/latenza.
+
+    Args:
+        email_cliente: Mittente da hand-off A1; se vuoto/None viene sostituito
+            con ``sconosciuto@local`` per rispettare ``NOT NULL``.
+        risposta_generata: Testo ``soluzione_proposta`` del JSON Resolver.
+        priorita_ticket: ``priorita`` A2 già normalizzata (Low|Medium|Critical).
+        token_input / token_output: Accumulo ``response.usage`` A1+A2.
+        costo_calcolato: Risultato equazione PDF (in × 5e-6 + out × 1.5e-5).
+        latenza_secondi: Delta wall-clock post-guardrail → pre-INSERT.
+        id_ordine: ID dal JSON A2; ``None`` o ID sconosciuto → colonna NULL.
+
+    Returns:
+        ``id_risposta`` AUTOINCREMENT (utile a print ``[TELEMETRIA]`` e al
+        dict restituito dalla pipeline per la demo in ``main``).
+    """
+    # Normalizziamo l'email PRIMA della INSERT: stringa vuota / solo spazi
+    # violerebbe NOT NULL in modo silenzioso se passassimo "" (SQLite accetta
+    # "" come valore non-NULL). Il fallback didattico è fissato dal piano.
+    email_norm = (email_cliente or "").strip() or _EMAIL_CLIENTE_FALLBACK
+
+    sql_insert_final = """
+    INSERT INTO final_response (
+        id_ordine,
+        email_cliente,
+        risposta_generata,
+        priorita_ticket,
+        token_input,
+        token_output,
+        costo_calcolato,
+        latenza_secondi
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+    """
+
+    # Verifica esistenza ordine: SELECT 1 è più economico di un INSERT che
+    # fallisce e richiede rollback; con PRAGMA foreign_keys=ON un ID fantasma
+    # alzerebbe IntegrityError e annullerebbe tutta la transazione del context.
+    sql_ordine_exists = """
+    SELECT 1 FROM ordini WHERE id_ordine = ? LIMIT 1;
+    """
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # id_ordine sicuro per FK: None / "" / ID assente in ordini → NULL.
+        # Non inventiamo ID: se A2 non ha trovato l'ordine, la colonna resta NULL
+        # e l'operatore può comunque leggere risposta + telemetria.
+        id_ordine_fk: str | None = None
+        if id_ordine is not None:
+            id_candidato = str(id_ordine).strip()
+            if id_candidato:
+                cursor.execute(sql_ordine_exists, (id_candidato,))
+                if cursor.fetchone() is not None:
+                    id_ordine_fk = id_candidato
+                else:
+                    # Diagnostica a terminale (niente logger su file): così
+                    # in demo si vede perché id_ordine è NULL nonostante A2
+                    # abbia proposto un codice.
+                    print(
+                        "[DB] WARNING: id_ordine="
+                        f"{id_candidato!r} assente in ordini → "
+                        "final_response.id_ordine=NULL (FK)."
+                    )
+
+        cursor.execute(
+            sql_insert_final,
+            (
+                id_ordine_fk,
+                email_norm,
+                risposta_generata,
+                priorita_ticket,
+                int(token_input),
+                int(token_output),
+                float(costo_calcolato),
+                float(latenza_secondi),
+            ),
+        )
+        # lastrowid = id_risposta appena creato (INTEGER PRIMARY KEY AUTOINCREMENT).
+        return int(cursor.lastrowid)
+
+
+# =====================================================================
 # FUNZIONE DI INIZIALIZZAZIONE
 # =====================================================================
 
