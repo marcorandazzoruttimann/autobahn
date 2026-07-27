@@ -14,6 +14,8 @@ from src.config import NONCE_END, NONCE_START
 from src.database import (
     get_ordine_importo,
     insert_final_response,
+    load_workflow_state,
+    mark_workflow_resumed,
     save_workflow_pending,
 )
 from src.errors import ResolverError, SecurityGuardrailError, TriageError
@@ -56,6 +58,12 @@ _PRUNE_CODA_MAX = 4
 # Soglia HITL (STEP 5): allineata a policy_supporto.txt — oltre questo importo
 # ``issue_refund`` non esegue subito: congela workflow_states in PENDING_APPROVAL.
 SOGLIA_RIMBORSO_EUR = 100.0
+
+# Log dell'evento umano al resume (HITL): dopo l'approvazione non si richiama
+# l'LLM — solo ``issue_refund`` deterministico + INSERT su ``final_response``.
+_MSG_SUPERVISORE_APPROVAZIONE = (
+    "[SUPERVISORE] Rimborso approvato. Procedi con issue_refund e chiudi il ticket."
+)
 
 # ---------------------------------------------------------------------
 # TELEMETRIA STEP 4 — coefficienti costo (equazioni PDF, non prezzi reali)
@@ -882,12 +890,305 @@ def run_resolver_agent(
 
 
 # =====================================================================
+# HITL RESUME — ripresa workflow congelato (STEP 5)
+# =====================================================================
+
+
+def _estrai_issue_refund_pendente(
+    messages: list[dict[str, Any]],
+) -> tuple[str, str]:
+    """Dal messaggio assistant congelato: ``(order_id, reason)`` di ``issue_refund``.
+
+    Scorre la cronologia all'indietro: al breakpoint la lista termina con un
+    ``assistant`` che ha ``tool_calls`` su ``issue_refund`` *senza* ancora
+    l'observation ``role=tool``. Se manca (seed corrotto), solleva ``ResolverError``.
+    """
+    # reverse: l'ultimo assistant con issue_refund è quello del freeze.
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls") or []
+        # Anche qui reverse: se più tool nello stesso turno, l'ultimo issue_refund
+        # è tipicamente quello che ha triggerato il freeze (primo > soglia).
+        for tc in reversed(tool_calls):
+            fn = tc.get("function") or {}
+            if fn.get("name") != "issue_refund":
+                continue #in pratica il continue serve a trovare l'elemento che ci interessa prima di scorrere
+                        #con il successivo codice. E' solo un metodo per non scrivere il resto del codice
+                        #al di fuori del for...daltronde potrebbero esserci più elementi che sosddisfsno
+                        #la condizione
+
+            raw_args = fn.get("arguments") or "{}"
+            if isinstance(raw_args, str):
+                try:
+                    args_dict = json.loads(raw_args) if raw_args.strip() else {}
+                except json.JSONDecodeError as exc:
+                    raise ResolverError(
+                        f"arguments issue_refund non JSON al resume: {exc}"
+                    ) from exc
+            elif isinstance(raw_args, dict):
+                args_dict = raw_args
+            else:
+                raise ResolverError(
+                    f"arguments issue_refund tipo non supportato: {type(raw_args).__name__}"
+                )
+
+            order_id = str(args_dict.get("order_id") or "").strip()
+            reason = str(args_dict.get("reason") or "").strip()
+            if not order_id:
+                raise ResolverError(
+                    "tool_call issue_refund senza order_id al resume."
+                )
+            # reason può essere vuota nel seed: issue_refund la rifiuterà;
+            # meglio fallire qui con messaggio chiaro sul contratto HITL.
+            if not reason:
+                raise ResolverError(
+                    "tool_call issue_refund senza reason al resume."
+                )
+            return order_id, reason
+
+    raise ResolverError(
+        "Nessun tool_call issue_refund pendente nei messaggi congelati: "
+        "impossibile riprendere il workflow HITL."
+    )
+
+
+def _soluzione_da_observation_refund(
+    observation: str,
+    *,
+    order_id: str,
+    reason: str,
+) -> str:
+    """Testo ``soluzione_proposta`` deterministico dal JSON di ``issue_refund``.
+
+    Post-HITL non c'è un altro turno LLM: chiudiamo il ticket con un messaggio
+    costruito dall'observation del solo tool di rimborso.
+    """
+    try:
+        payload = json.loads(observation) if observation.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    # Observation di errore strutturato: non fingiamo un rimborso riuscito.
+    #l'Observation è SEMPRE l'output del tool che viene inviato all llm ed ha sempre "role":"tool"
+    if payload.get("errore"):
+        return (
+            f"Il rimborso per l'ordine {order_id} non è stato completato "
+            f"dopo l'approvazione supervisore: {payload.get('errore')}."
+        )
+
+    importo = payload.get("importo_rimborsato_eur")
+    messaggio_tool = str(payload.get("messaggio") or "").strip()
+    if messaggio_tool:
+        corpo = messaggio_tool
+    elif importo is not None:
+        corpo = (
+            f"Rimborso di {float(importo):.2f}€ registrato per l'ordine {order_id}."
+        )
+    else:
+        corpo = f"Rimborso registrato per l'ordine {order_id}."
+
+    return (
+        f"{corpo} "
+        f"Approvato dal supervisore. Motivazione: {reason}."
+    )
+
+
+def resume_hitl_workflow(
+    id_sessione: str,
+    *,
+    telemetria: TelemetriaLlm | None = None,
+) -> dict[str, Any]:
+    """Riprende un workflow ``PENDING_APPROVAL`` dopo l'evento umano.
+
+    Consegna STEP 5 (post-approvazione): **nessun altro tool né turno LLM**.
+      1. Carica ``workflow_states`` e deserializza i messaggi.
+      2. Estrae args ``issue_refund`` dall'assistant congelato.
+      3. Simula l'approvazione supervisore (log).
+      4. Esegue **solo** ``issue_refund`` (bypass soglia HITL).
+      5. ``insert_final_response`` sul DB principale + telemetria resume.
+      6. ``mark_workflow_resumed`` → ``APPROVED``.
+    """
+    sessione = (id_sessione or "").strip()
+    if not sessione:
+        raise TriageError(
+            "resume_hitl_workflow richiede id_sessione non vuoto."
+        )
+
+    print(f"[HITL] Resume workflow | id_sessione={sessione!r}")
+    # Timer *all'inizio* del resume: latenza = solo lavoro post-approvazione
+    # (issue_refund + INSERT; zero chiamate LLM).
+    t0 = avvia_timer_latenza()
+
+    # --- 1. Carica stato congelato da SQLite ---
+    stato = load_workflow_state(sessione)
+    if stato is None:
+        raise TriageError(
+            f"Sessione HITL non trovata in workflow_states: {sessione!r}"
+        )
+
+    stato_wf = str(stato.get("stato_workflow") or "")
+    if stato_wf != "PENDING_APPROVAL":
+        # Es. già APPROVED: evitare doppio rimborso / doppia final_response.
+        raise TriageError(
+            f"Sessione {sessione!r} non riprendibile: "
+            f"stato_workflow={stato_wf!r} (atteso PENDING_APPROVAL)."
+        )
+
+    # messaggi_serializzati è TEXT JSON: stesso formato di save_workflow_pending.
+    try:
+        messages = json.loads(stato["messaggi_serializzati"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ResolverError(
+            f"messaggi_serializzati non deserializzabili per {sessione!r}: {exc}"
+        ) from exc
+
+    if not isinstance(messages, list) or not messages:
+        raise ResolverError(
+            f"Cronologia vuota o non-lista per sessione {sessione!r}."
+        )
+
+    # Telemetria resume: resta a 0 token (nessuna call LLM post-HITL).
+    # Accettiamo comunque l'istanza dall'orchestratore per il contratto firma.
+    if telemetria is None:
+        telemetria = TelemetriaLlm()
+
+    email_cliente = str(stato.get("email_cliente") or "")
+
+    # --- 2. Args del tool call pendente (solo issue_refund) ---
+    order_id, reason = _estrai_issue_refund_pendente(messages)
+    print(f"[HITL] issue_refund pendente | order_id={order_id!r}")
+
+    # --- 3. Evento umano: supervisore approva (fuori banda, solo log) ---
+    print(f"[HITL] Simulazione supervisore: {_MSG_SUPERVISORE_APPROVAZIONE}")
+
+    # --- 4. Unico tool ammesso al resume: issue_refund ---
+    # Bypass deliberato di ``_esegui_tool_resolver``: la soglia HITL è già
+    # stata superata con l'approvazione umana; nessun altro tool viene eseguito.
+    observation = execute_tool(
+        "issue_refund",
+        {"order_id": order_id, "reason": reason},
+    )
+    print(f"[HITL] Observation issue_refund (post-approvazione): {observation[:280]!r}")
+
+    # Fallimento soft del tool (ordine assente, args invalidi): non scrivere
+    # final_response come se il rimborso fosse andato a buon fine.
+    try:
+        obs_dict = json.loads(observation) if observation.strip() else {}
+    except json.JSONDecodeError:
+        obs_dict = {}
+    if isinstance(obs_dict, dict) and obs_dict.get("errore"):
+        raise ResolverError(
+            f"issue_refund fallito al resume per {order_id!r}: "
+            f"{obs_dict.get('errore')}"
+        )
+
+    # Ticket finale costruito in modo deterministico (nessun turno LLM).
+    soluzione = _soluzione_da_observation_refund(
+        observation,
+        order_id=order_id,
+        reason=reason,
+    )
+    # Critical: rimborso sopra soglia che ha richiesto HITL.
+    priorita = "Critical"
+    id_ordine_finale = stato.get("id_ordine") or order_id
+
+    risultato = {
+        "soluzione_proposta": soluzione,
+        "priorita": priorita,
+        "id_ordine": id_ordine_finale,
+        "policy_usata": "",
+        "stato_ordine_rilevato": None,
+    }
+    print(
+        "[OUTPUT] Resume HITL OK (solo issue_refund, no LLM) | "
+        f"priorita={priorita} | id_ordine={id_ordine_finale!r}"
+    )
+    print(f"[OUTPUT] {json.dumps(risultato, ensure_ascii=False)}")
+
+    # --- 5. Persistenza final_response (DB principale) + telemetria ---
+    latenza = misura_latenza_secondi(t0)
+    costo = telemetria.costo_calcolato()
+
+    id_risposta = insert_final_response(
+        id_ordine=id_ordine_finale if isinstance(id_ordine_finale, str) else None,
+        email_cliente=email_cliente,
+        risposta_generata=soluzione,
+        priorita_ticket=priorita,
+        token_input=telemetria.token_input,
+        token_output=telemetria.token_output,
+        costo_calcolato=costo,
+        latenza_secondi=latenza,
+    )
+
+    # --- 6. Segna sessione APPROVED (solo dopo INSERT riuscita) ---
+    mark_workflow_resumed(sessione)
+
+    out = {
+        **risultato,
+        **telemetria.as_dict(),
+        "latenza_secondi": latenza,
+        "id_risposta": id_risposta,
+        "id_sessione": sessione,
+        "stato_workflow": "APPROVED",
+    }
+    print(
+        "[TELEMETRIA] "
+        f"tokens_in={out['token_input']} "
+        f"tokens_out={out['token_output']} "
+        f"costo={out['costo_calcolato']:.6f} "
+        f"latenza={latenza:.3f}s "
+        f"id_risposta={id_risposta}"
+    )
+    return out
+
+
+# =====================================================================
 # ORCHESTRATORE — elabora_email (pipeline lineare / deterministica)
 # =====================================================================
 
 
-def elabora_email(testo: str) -> dict[str, Any]:
-    """Guardrail → Triage → Resolver → ``final_response`` + telemetria; oppure ticket ATTACK_BLOCKED."""
+def elabora_email(
+    testo: str,
+    *,
+    is_resume: bool = False,
+    id_sessione: str | None = None,
+) -> dict[str, Any]:
+    """Pipeline email *oppure* resume HITL.
+
+    Path normale (``is_resume=False``):
+      Guardrail → Triage → Resolver → ``final_response`` + telemetria;
+      oppure ticket ``ATTACK_BLOCKED`` / dict ``PENDING_APPROVAL``.
+
+    Path resume (``is_resume=True``):
+      Salta guardrail/Triage/nuova email; richiede ``id_sessione``;
+      chiama ``resume_hitl_workflow`` (persistenza inclusa).
+    """
+    # --- Path HITL resume: skip completo pipeline ingresso ---
+    if is_resume:
+        sessione = (id_sessione or "").strip()
+        if not sessione:
+            raise TriageError(
+                "elabora_email(is_resume=True) richiede id_sessione non vuoto "
+                "(es. SESS-TEST-RESUME-01)."
+            )
+
+        print(
+            "[PIPELINE] Avvio elabora_email in modalità RESUME HITL | "
+            f"id_sessione={sessione!r}"
+        )
+        # Telemetria dedicata al resume (token freeze non ripresi da DB).
+        risultato = resume_hitl_workflow(
+            sessione,
+            telemetria=TelemetriaLlm(),
+        )
+        print("[PIPELINE] elabora_email RESUME completata con successo.")
+        print(f"[OUTPUT] {json.dumps(risultato, ensure_ascii=False)}")
+        return risultato
+
     print("[PIPELINE] Avvio elabora_email (Guardrail → Triage → Hand-off → Resolver).")
 
     # --- Step 1: Guardrail deterministico (regex) ---

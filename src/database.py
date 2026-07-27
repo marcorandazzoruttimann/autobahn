@@ -117,29 +117,76 @@ def seed_db(conn: sqlite3.Connection) -> None:
     """
     cursor.executemany(sql_insert_ordine, ordini_test)
 
-    # Scenario 2: Record di pre-congelamento in workflow_states (Per testare il Resume dello STEP 5)
-    # Creiamo una sessione finta congelata per l'utente 'antonio.neri@example.com' 
-    # che richiede un rimborso sull'ordine da 250€
+    # Scenario 2: Record di pre-congelamento in workflow_states (Resume STEP 5).
+    # Stato esatto del breakpoint: assistant con tool_calls issue_refund, *senza*
+    # observation role=tool. Così ``resume_hitl_workflow`` può estrarre order_id/
+    # reason e completare il round OpenAI dopo l'approvazione supervisore.
     id_sessione_test = "SESS-TEST-RESUME-01"
-    
-    # Peculiarità Python: Simuliamo la serializzazione JSON di una cronologia di messaggi dell'Agente 2.
-    # In Python, le triple virgolette ci permettono di formattare stringhe multilinea complesse.
-    messaggi_finti_json = """[
-        {"role": "system", "content": "Sei l'Agente 2 Customer Resolver."},
-        {"role": "user", "content": "Voglio il rimborso per l'ordine ORD-404-REFUND-HIGH, è rotto."},
-        {"role": "assistant", "content": "Ho verificato l'ordine ORD-404-REFUND-HIGH di importo 250.00€. Procedo ad attivare il tool di rimborso."}
-    ]"""
 
-    sql_insert_workflow = """
-    INSERT OR IGNORE INTO workflow_states (id_sessione, email_cliente, id_ordine, stato_workflow, messaggi_serializzati)
+    # Serializziamo con json.dumps (non stringa multilinea grezza): evita errori
+    # di escaping nelle arguments del function call e resta allineato a
+    # save_workflow_pending (stesso formato TEXT in messaggi_serializzati).
+    messaggi_seed_resume = [
+        {
+            "role": "system",
+            "content": (
+                "Sei il Customer Resolver di Autobahn Customer Care. "
+                "Usa i tool e chiudi con JSON finale."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Hand-off JSON dal Triage Analyst:\n"
+                '{"email_cliente": "antonio.neri@example.com", '
+                '"lingua": "it", "riassunto": "rimborso alto", '
+                '"id_ordine_sospetto": "ORD-404-REFUND-HIGH"}\n\n'
+                "Voglio il rimborso per l'ordine ORD-404-REFUND-HIGH, è rotto."
+            ),
+        },
+        {
+            "role": "assistant",
+            # content None: al freeze tipico l'LLM emette solo tool_calls.
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_seed_refund_404",
+                    "type": "function",
+                    "function": {
+                        "name": "issue_refund",
+                        # arguments come stringa JSON grezza (contratto Chat Completions).
+                        "arguments": json.dumps(
+                            {
+                                "order_id": "ORD-404-REFUND-HIGH",
+                                "reason": (
+                                    "prodotto difettoso — richiesta rimborso "
+                                    "oltre soglia HITL"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        },
+    ]
+    messaggi_finti_json = json.dumps(messaggi_seed_resume, ensure_ascii=False)
+
+    # INSERT OR REPLACE: se il seed precedente aveva messaggi senza tool_calls,
+    # al re-init allineiamo la cronologia al contratto resume (IGNORE lascerebbe
+    # la riga vecchia e --resume SESS-TEST-RESUME-01 fallirebbe).
+    sql_upsert_workflow = """
+    INSERT OR REPLACE INTO workflow_states (
+        id_sessione, email_cliente, id_ordine, stato_workflow, messaggi_serializzati
+    )
     VALUES (?, ?, ?, ?, ?);
     """
-    cursor.execute(sql_insert_workflow, (
-        id_sessione_test, 
-        "antonio.neri@example.com", 
-        "ORD-404-REFUND-HIGH", 
-        "PENDING_APPROVAL", 
-        messaggi_finti_json
+    cursor.execute(sql_upsert_workflow, (
+        id_sessione_test,
+        "antonio.neri@example.com",
+        "ORD-404-REFUND-HIGH",
+        "PENDING_APPROVAL",
+        messaggi_finti_json,
     ))
 
     print("    [+] Dati di test (seed) inseriti con successo (o già esistenti).")
