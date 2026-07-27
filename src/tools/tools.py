@@ -117,6 +117,88 @@ def get_support_policy(query: str) -> str:
 
 
 # =====================================================================
+# TOOL 3 — Rimborso monetario (didattico: nessun gateway pagamenti reale)
+# =====================================================================
+
+
+def issue_refund(order_id: str, reason: str) -> str:
+    """Emette un rimborso monetario simulato per un ordine già verificato.
+
+    STEP 5: l'esecuzione reale può essere intercettata dall'orchestratore se
+    ``importo > 100€`` (HITL). Qui validiamo l'ID, rileggiamo l'importo da SQLite
+    per coerenza con il breakpoint, e restituiamo un JSON di successo didattico.
+
+    Args:
+        order_id: Chiave primaria ordine (deve iniziare con ``ORD-``).
+        reason: Motivazione breve del rimborso (audit / ticket).
+
+    Returns:
+        JSON di successo o errore strutturato (ordine assente, ID malformato).
+    """
+    order_id_norm = (order_id or "").strip()
+    reason_norm = (reason or "").strip()
+
+    if not order_id_norm:
+        return json.dumps(
+            {"errore": "order_id vuoto o mancante", "id_ordine": order_id},
+            ensure_ascii=False,
+        )
+
+    # Convenzione Autobahn: tutti gli id ordine nel seed e nel triage usano ORD-.
+    if not order_id_norm.upper().startswith("ORD-"):
+        return json.dumps(
+            {
+                "errore": "order_id non valido: atteso prefisso ORD-",
+                "id_ordine": order_id_norm,
+            },
+            ensure_ascii=False,
+        )
+
+    if not reason_norm:
+        return json.dumps(
+            {
+                "errore": "reason vuota: serve una motivazione per il rimborso",
+                "id_ordine": order_id_norm,
+            },
+            ensure_ascii=False,
+        )
+
+    sql_select = """
+    SELECT id_ordine, importo
+    FROM ordini
+    WHERE id_ordine = ?;
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql_select, (order_id_norm,))
+        row = cursor.fetchone()
+
+    if row is None:
+        return json.dumps(
+            {
+                "errore": "ordine non trovato — impossibile emettere rimborso",
+                "id_ordine": order_id_norm,
+            },
+            ensure_ascii=False,
+        )
+
+    id_ordine_db, importo = row
+    importo_float = float(importo)
+
+    # Payload didattico: in produzione qui ci sarebbe l'ID transazione del PSP.
+    payload = {
+        "esito": "rimborso_emesso",
+        "id_ordine": id_ordine_db,
+        "importo_rimborsato_eur": importo_float,
+        "motivazione": reason_norm,
+        "messaggio": (
+            f"Rimborso simulato di {importo_float:.2f}€ registrato per {id_ordine_db}."
+        ),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+# =====================================================================
 # Registry + schema OpenAI (function calling)
 # =====================================================================
 
@@ -125,6 +207,7 @@ def get_support_policy(query: str) -> str:
 TOOL_MAP: dict[str, Callable[..., str]] = {
     "get_order_status": get_order_status,
     "get_support_policy": get_support_policy,
+    "issue_refund": issue_refund,
 }
 
 # Schema tools nel formato Chat Completions API (type=function).
@@ -181,6 +264,39 @@ OPENAI_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "issue_refund",
+            "description": (
+                "Emette un rimborso monetario diretto per un ordine già verificato "
+                "(simulazione didattica Autobahn). Usare SOLO dopo get_order_status "
+                "e get_support_policy quando la policy consente un rimborso in denaro. "
+                "Per importi superiori a 100€ il sistema può sospendere il workflow "
+                "in attesa di approvazione supervisore."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": (
+                            "Identificativo ordine da rimborsare (es. ORD-302-REFUND-LOW)."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Motivazione sintetica del rimborso per audit "
+                            "(es. 'reso entro 14 giorni', 'ordine smarrito — policy rimborso')."
+                        ),
+                    },
+                },
+                "required": ["order_id", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -200,10 +316,10 @@ def execute_tool(name: str, arguments: dict[str, Any] | str) -> str:
     print(f"[TOOL] {name}({arguments!r})")
 
     if name not in TOOL_MAP:
-        # Non solleviamo: l'LLM può aver allucinato un tool (es. issue_refund in STEP 3).
+        # Non solleviamo: l'LLM può aver allucinato un nome tool inesistente.
         # Restituiamo errore in observation così può correggersi al turno successivo.
         return json.dumps(
-            {"errore": f"tool sconosciuto o non disponibile in STEP 3: {name}"},
+            {"errore": f"tool sconosciuto o non disponibile: {name}"},
             ensure_ascii=False,
         )
 
