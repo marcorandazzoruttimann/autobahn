@@ -1,5 +1,6 @@
+import json
 import sqlite3
-from typing import Generator
+from typing import Any, Generator
 from contextlib import contextmanager
 
 # AGGIORNAMENTO: Importiamo i percorsi centralizzati e la funzione di utility
@@ -332,6 +333,209 @@ def insert_final_response(
         )
         # lastrowid = id_risposta appena creato (INTEGER PRIMARY KEY AUTOINCREMENT).
         return int(cursor.lastrowid)
+
+
+# =====================================================================
+# WORKFLOW HITL (STEP 5): ordini, congelamento, resume
+# =====================================================================
+
+def get_ordine_importo(id_ordine: str) -> float | None:
+    """Legge l'importo EUR di un ordine per la soglia di rimborso (100€).
+
+    Usata dal breakpoint su ``issue_refund``: se l'ordine non esiste restituisce
+    ``None`` (observation errore lato Resolver), altrimenti un ``float`` per il
+    confronto con ``SOGLIA_RIMBORSO_EUR`` in ``logic.py``.
+
+    Args:
+        id_ordine: Chiave primaria in ``ordini`` (es. ``ORD-404-REFUND-HIGH``).
+
+    Returns:
+        Importo come float, oppure ``None`` se ID assente o stringa vuota.
+    """
+    id_candidato = (id_ordine or "").strip()
+    if not id_candidato:
+        return None
+
+    sql_select_importo = """
+    SELECT importo FROM ordini WHERE id_ordine = ? LIMIT 1;
+    """
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql_select_importo, (id_candidato,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        # SQLite può restituire DECIMAL come str/float; normalizziamo a float
+        # per confronti numerici stabili con la soglia HITL.
+        return float(row[0])
+
+
+def save_workflow_pending(
+    *,
+    id_sessione: str,
+    email_cliente: str,
+    messaggi: list[dict[str, Any]],
+    id_ordine: str | None = None,
+) -> None:
+    """Congela il Resolver: INSERT OR REPLACE su ``workflow_states``.
+
+    Serializza la cronologia OpenAI **dopo** l'assistant con ``tool_calls`` su
+    ``issue_refund`` e **prima** dell'observation ``role=tool`` (stato esatto
+    del breakpoint). Lo stato workflow è sempre ``PENDING_APPROVAL``.
+
+    ``id_ordine`` viene scritto solo se presente in ``ordini``: la FK
+    ``workflow_states.id_ordine → ordini(id_ordine)`` altrimenti farebbe
+    fallire la transazione con ``PRAGMA foreign_keys=ON``.
+
+    Args:
+        id_sessione: Chiave primaria (es. ``SESS-`` + uuid hex).
+        email_cliente: Mittente da hand-off A1.
+        messaggi: Lista messaggi Resolver da ``json.dumps`` in ``messaggi_serializzati``.
+        id_ordine: ID proposto dal tool call; ``None`` o assente in DB → colonna NULL.
+    """
+    sessione_norm = (id_sessione or "").strip()
+    if not sessione_norm:
+        raise ValueError("id_sessione obbligatorio per save_workflow_pending")
+
+    email_norm = (email_cliente or "").strip() or _EMAIL_CLIENTE_FALLBACK
+
+    # default=str: tool_call id e campi non-JSON-serializzabili non bloccano il freeze.
+    messaggi_json = json.dumps(messaggi, ensure_ascii=False, default=str)
+
+    sql_ordine_exists = """
+    SELECT 1 FROM ordini WHERE id_ordine = ? LIMIT 1;
+    """
+
+    sql_upsert_workflow = """
+    INSERT OR REPLACE INTO workflow_states (
+        id_sessione,
+        email_cliente,
+        id_ordine,
+        stato_workflow,
+        messaggi_serializzati
+    )
+    VALUES (?, ?, ?, 'PENDING_APPROVAL', ?);
+    """
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        id_ordine_fk: str | None = None
+        if id_ordine is not None:
+            id_candidato = str(id_ordine).strip()
+            if id_candidato:
+                cursor.execute(sql_ordine_exists, (id_candidato,))
+                if cursor.fetchone() is not None:
+                    id_ordine_fk = id_candidato
+                else:
+                    print(
+                        "[DB] WARNING: id_ordine="
+                        f"{id_candidato!r} assente in ordini → "
+                        "workflow_states.id_ordine=NULL (FK)."
+                    )
+
+        cursor.execute(
+            sql_upsert_workflow,
+            (sessione_norm, email_norm, id_ordine_fk, messaggi_json),
+        )
+
+
+def load_workflow_state(id_sessione: str) -> dict[str, Any] | None:
+    """Carica una riga ``workflow_states`` per il resume HITL.
+
+    Restituisce un dict con le colonne della tabella; ``messaggi_serializzati``
+    resta stringa JSON (``logic.py`` fa ``json.loads`` quando ripristina la cronologia).
+
+    Args:
+        id_sessione: Chiave primaria della sessione congelata.
+
+    Returns:
+        Dict con chiavi ``id_sessione``, ``email_cliente``, ``id_ordine``,
+        ``stato_workflow``, ``messaggi_serializzati``, ``data_congelamento``;
+        ``None`` se la sessione non esiste.
+    """
+    sessione_norm = (id_sessione or "").strip()
+    if not sessione_norm:
+        return None
+
+    sql_load_workflow = """
+    SELECT
+        id_sessione,
+        email_cliente,
+        id_ordine,
+        stato_workflow,
+        messaggi_serializzati,
+        data_congelamento
+    FROM workflow_states
+    WHERE id_sessione = ?
+    LIMIT 1;
+    """
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql_load_workflow, (sessione_norm,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+
+        return {
+            "id_sessione": row[0],
+            "email_cliente": row[1],
+            "id_ordine": row[2],
+            "stato_workflow": row[3],
+            "messaggi_serializzati": row[4],
+            "data_congelamento": row[5],
+        }
+
+        """ E' stato preferito l'unpacking per indici per poter ritornare direttamente il json,
+        altrimenti avrei dovuto appoggiare i valori in delle variabili provvisorie e
+        poi rimapparle sul json (vedi sotto)
+        
+        Unpacking diretto:
+            (
+                id_sess,
+                email_cli,
+                id_ord,
+                stato_wf,
+                msg_ser,
+                data_cong,
+            ) = row
+
+            return {
+                "id_sessione": id_sess,
+                "email_cliente": email_cli,
+                ...
+            }
+        """
+
+
+def mark_workflow_resumed(id_sessione: str) -> bool:
+    """Segna il workflow come concluso dopo un resume riuscito.
+
+    Aggiorna ``stato_workflow`` a ``APPROVED`` (la riga resta per audit didattico;
+    non cancelliamo la sessione). Se l'ID non esiste, non solleva eccezione.
+
+    Args:
+        id_sessione: Sessione appena ripresa da ``resume_hitl_workflow``.
+
+    Returns:
+        ``True`` se almeno una riga è stata aggiornata, ``False`` altrimenti.
+    """
+    sessione_norm = (id_sessione or "").strip()
+    if not sessione_norm:
+        return False
+
+    sql_mark_approved = """
+    UPDATE workflow_states
+    SET stato_workflow = 'APPROVED'
+    WHERE id_sessione = ?;
+    """
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql_mark_approved, (sessione_norm,))
+        return cursor.rowcount > 0
 
 
 # =====================================================================
