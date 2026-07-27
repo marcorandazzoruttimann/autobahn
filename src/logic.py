@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.client import MODEL, get_client
 from src.config import NONCE_END, NONCE_START
-from src.database import insert_final_response
+from src.database import (
+    get_ordine_importo,
+    insert_final_response,
+    save_workflow_pending,
+)
 from src.errors import ResolverError, SecurityGuardrailError, TriageError
 from src.guardrails import sanitize_email_input
 from src.tools import OPENAI_TOOLS, execute_tool
@@ -47,6 +52,10 @@ _CAMPI_OBBLIGATORI_RESOLVER = (
 # Quanti messaggi *dopo* system+user0 tenere nella coda (piano STEP 4).
 # Valore fisso dal PDF: ultimi 4 scambi (assistant / tool / user di correzione).
 _PRUNE_CODA_MAX = 4
+
+# Soglia HITL (STEP 5): allineata a policy_supporto.txt — oltre questo importo
+# ``issue_refund`` non esegue subito: congela workflow_states in PENDING_APPROVAL.
+SOGLIA_RIMBORSO_EUR = 100.0
 
 # ---------------------------------------------------------------------
 # TELEMETRIA STEP 4 — coefficienti costo (equazioni PDF, non prezzi reali)
@@ -624,14 +633,104 @@ def _chiama_llm_resolver(
     return response
 
 
+def _esegui_tool_resolver(
+    name: str,
+    arguments: dict[str, Any] | str,
+    *,
+    messages: list[dict[str, Any]],
+    email_cliente: str,
+) -> str | dict[str, Any]:
+    """Esegue un tool Resolver; su ``issue_refund`` > soglia congela in ``PENDING_APPROVAL``."""
+    # Tool "normali": nessun checkpoint — stesso percorso di STEP 3/4.
+    if name != "issue_refund":
+        return execute_tool(name, arguments)
+
+    # --- Parse args (stessa tolleranza di execute_tool: str JSON o dict) ---
+    if isinstance(arguments, str):
+        try:
+            args_dict: dict[str, Any] = (
+                json.loads(arguments) if arguments.strip() else {}
+            )
+        except json.JSONDecodeError as exc:
+            # Soft-error in observation: il modello può correggere al turno dopo.
+            return json.dumps(
+                {
+                    "errore": "arguments non è JSON valido",
+                    "dettaglio": str(exc),
+                    "raw": arguments,
+                },
+                ensure_ascii=False,
+            )
+    else:
+        args_dict = dict(arguments)
+
+    order_id = str(args_dict.get("order_id") or "").strip()
+    reason = str(args_dict.get("reason") or "").strip()
+
+    # Fonte di verità per la soglia: SQLite, non l'importo "ricordato" dall'LLM.
+    importo = get_ordine_importo(order_id) if order_id else None
+    if importo is None:
+        # Ordine assente / ID vuoto: observation errore, niente freeze (niente da approvare).
+        return json.dumps(
+            {
+                "errore": "ordine non trovato — impossibile emettere rimborso",
+                "id_ordine": order_id or None,
+            },
+            ensure_ascii=False,
+        )
+
+    # --- Breakpoint HITL: importo sopra soglia → congela, non esegue il tool ---
+    if importo > SOGLIA_RIMBORSO_EUR:
+        # Prefisso SESS- + uuid hex: id stampabile a terminale e riprendibile con --resume.
+        id_sessione = f"SESS-{uuid.uuid4().hex}"
+        print(
+            f"[HITL] Breakpoint issue_refund | importo={importo:.2f}€ > "
+            f"{SOGLIA_RIMBORSO_EUR:.0f}€ | id_sessione={id_sessione} | "
+            f"id_ordine={order_id!r}"
+        )
+        # Persistenza: cronologia *dopo* assistant+tool_calls, *prima* dell'observation.
+        # id_ordine: save_workflow_pending azzera a NULL se assente in ordini (FK).
+        save_workflow_pending(
+            id_sessione=id_sessione,
+            email_cliente=email_cliente,
+            messaggi=messages,
+            id_ordine=order_id or None,
+        )
+        # Dict orchestratore: elabora_email riconosce PENDING_APPROVAL e skippa
+        # insert_final_response / telemetria finale (token già spesi restano in RAM).
+        return {
+            "stato_workflow": "PENDING_APPROVAL",
+            "id_sessione": id_sessione,
+            "soluzione_proposta": (
+                "Workflow congelato: Richiesta di rimborso in attesa di "
+                "approvazione da parte di un supervisore."
+            ),
+            "priorita": "Critical",
+            "id_ordine": order_id or None,
+        }
+
+    # Sotto soglia: rimborso immediato (stesso dispatch di execute_tool).
+    # Passiamo dict già parsato così non ri-serializziamo args inutilmente.
+    return execute_tool(
+        name,
+        {"order_id": order_id, "reason": reason},
+    )
+
+
 def run_resolver_agent(
     triage: dict[str, Any],
     testo_email: str,
     telemetria: TelemetriaLlm | None = None,
 ) -> dict[str, Any]:
-    """Agente 2: loop ReAct (tool) → JSON finale. Solleva ``ResolverError`` se esauriti i turni."""
+    """Agente 2: loop ReAct (tool) → JSON finale. Solleva ``ResolverError`` se esauriti i turni.
+
+    Può anche restituire un dict ``PENDING_APPROVAL`` se ``issue_refund`` supera
+    la soglia HITL (workflow congelato, senza JSON finale di risoluzione).
+    """
     print("[RESOLVER] Avvio Agente 2 (ReAct tool calling → JSON finale).")
     # ``triage`` è tipizzato dict[str, Any]: A1 lo valida già; niente check runtime.
+    # email_cliente serve al freeze HITL (colonna workflow_states, non inventata dall'LLM).
+    email_cliente = str(triage.get("email_cliente") or "")
 
     # Cronologia chat: system + user iniziale; i turni appendono assistant/tool.
     # Questa lista *completa* cresce a ogni turno; il prune produce una vista
@@ -671,15 +770,41 @@ def run_resolver_agent(
             print(f"[RESOLVER] tool_calls richiesti: {nomi}")
 
             # Prima l'assistant con tool_calls, poi un messaggio tool per ciascun id.
+            # L'append avviene *prima* del loop tool: al freeze HITL la cronologia
+            # serializzata include già questo assistant (breakpoint esatto).
             messages.append(_assistant_message_to_dict(message))
             for tc in tool_calls:
-                # execute_tool stampa già [TOOL] e gestisce JSON args / errori soft.
-                observation = execute_tool(
+                # Intercetta issue_refund > soglia; altri tool → execute_tool.
+                esito = _esegui_tool_resolver(
                     tc.function.name,
                     tc.function.arguments,
+                    messages=messages,
+                    email_cliente=email_cliente,
                 )
-                # Log troncato: observation DB/RAG possono essere lunghe.
-                print(f"[RESOLVER] Observation {tc.function.name}: {observation[:280]!r}")
+                # Dict PENDING_APPROVAL: esci subito senza observation tool
+                # (anche se restano altri tool_calls nello stesso turno).
+                if (
+                    isinstance(esito, dict)
+                    and esito.get("stato_workflow") == "PENDING_APPROVAL"
+                ):
+                    print(
+                        "[RESOLVER] Workflow congelato (HITL) | "
+                        f"id_sessione={esito.get('id_sessione')!r}"
+                    )
+                    print(f"[OUTPUT] {json.dumps(esito, ensure_ascii=False)}")
+                    return esito
+
+                # Path normale: esito è observation stringa da riverberare all'LLM.
+                # (Il helper restituisce dict solo per PENDING_APPROVAL, già gestito sopra.)
+                # ASSERT: "Verifica che questa condizione sia VERA in questo preciso istante.
+                #  Se è vera, prosegui normalmente. Se è FALSA, 
+                # interrompi immediatamente il programma sollevando un errore AssertionError."
+                assert isinstance(esito, str)
+                observation = esito
+                print(
+                    f"[RESOLVER] Observation {tc.function.name}: "
+                    f"{observation[:280]!r}"
+                )
                 messages.append(
                     {
                         "role": "tool",
@@ -807,6 +932,19 @@ def elabora_email(testo: str) -> dict[str, Any]:
     # A2 riceve sia il JSON A1 sia l'email originale (con nonce interno).
     # Stesso ``telemetria``: i turni Resolver si sommano ai token Triage.
     risultato = run_resolver_agent(triage, testo, telemetria=telemetria)
+
+    # --- Step 4b: HITL freeze (issue_refund sopra soglia) ---
+    # Il Resolver ha già persistito workflow_states; qui usciamo *senza*
+    # insert_final_response né telemetria finale. I token spesi fino al
+    # breakpoint restano in ``telemetria`` in RAM ma non su DB (piano STEP 5).
+    if risultato.get("stato_workflow") == "PENDING_APPROVAL":
+        print(
+            "[HITL] Pipeline sospesa in attesa di supervisore | "
+            f"id_sessione={risultato.get('id_sessione')!r} | "
+            f"id_ordine={risultato.get('id_ordine')!r}"
+        )
+        print(f"[OUTPUT] {json.dumps(risultato, ensure_ascii=False)}")
+        return risultato
 
     # --- Step 5: chiudi telemetria (costo + latenza) ---
     # Misuriamo *prima* dell'INSERT così latenza_secondi riflette il lavoro
