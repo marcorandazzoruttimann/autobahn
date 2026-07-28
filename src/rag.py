@@ -59,7 +59,7 @@ def embed_texts(client: Any, texts: list[str]) -> list[list[float]]:
         return []
     response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return [item.embedding for item in response.data]#invia la lista chunk a openai e restituisce gli embeddings
-
+#questa funzione viene invocata si per l'embedding della sola query sia per l'intero set di chunk
 
 def query_similar(
     query_embedding: list[float],

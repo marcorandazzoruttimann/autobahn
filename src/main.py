@@ -76,7 +76,7 @@ Antonio Neri
 # Lista ordinata: la demo stampa un separatore per scenario e chiama
 # sempre la stessa ``elabora_email`` (pipeline lineare identica).
 _SCENARI_DEMO: list[tuple[str, str]] = [
-    ("1 — Ordine OK (ORD-999-OK / Spedito)", EMAIL_ORDINE_OK),
+    #("1 — Ordine OK (ORD-999-OK / Spedito)", EMAIL_ORDINE_OK),
     ("2 — Ordine smarrito (ORD-101-LOST)", EMAIL_ORDINE_SMARRITO),
     ("3 — Prompt injection (ATTACK_BLOCKED)", EMAIL_PROMPT_INJECTION),
     (

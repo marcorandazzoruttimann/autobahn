@@ -745,7 +745,7 @@ def run_resolver_agent(
     # ridotta solo per la request OpenAI (non sovrascriviamo ``messages``).
     # ovvero messages è un backup della lista messaggi originale senza pruning che non cancelliamo
     # prima di chiamare llm ripetiamo ogni volta il pruning 
-    messages: list[dict[str, Any]] = [
+    messages: list[dict[str, Any]] = [ #costruiamo il messaggio dell'agente 2 da inviare a llm
         {"role": "system", "content": _build_system_prompt_resolver()},
         {"role": "user", "content": _build_user_prompt_resolver(triage, testo_email)},
     ]
@@ -806,8 +806,9 @@ def run_resolver_agent(
                 # (Il helper restituisce dict solo per PENDING_APPROVAL, già gestito sopra.)
                 # ASSERT: "Verifica che questa condizione sia VERA in questo preciso istante.
                 #  Se è vera, prosegui normalmente. Se è FALSA, 
-                # interrompi immediatamente il programma sollevando un errore AssertionError."
+                # interrompi immediatamente il programma sollevando un errore AssertionError."           
                 assert isinstance(esito, str)
+                #se esito è stringa è il return di un qualsiasi altro tool eccetto issue_refund, altrimenti dict
                 observation = esito
                 print(
                     f"[RESOLVER] Observation {tc.function.name}: "
