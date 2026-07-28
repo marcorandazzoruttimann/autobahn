@@ -105,6 +105,11 @@ def _esegui_scenario(titolo: str, testo_email: str) -> dict:
 
     risultato = elabora_email(testo_email)
 
+    # Scenario 3 (injection): il guardrail restituisce il ticket senza
+    # invocare Triage/Resolver — messaggio dedicato prima del dump JSON.
+    if risultato.get("stato_ticket") == "ATTACK_BLOCKED":
+        print("[DEMO] Scenario bloccato dal guardrail, nessun LLM")
+
     # Riepilogo unico post-pipeline: utile se i print di fase scrollano via.
     print(
         "[DEMO] Risultato finale:\n"
