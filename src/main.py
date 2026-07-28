@@ -1,7 +1,7 @@
 # src/main.py
 """Entry-point demo STEP 5 — bootstrap + scenari ``elabora_email`` + resume HITL.
 
-Scenari allineati al seed DB (``database.seed_db``):
+Scenari allineati al seed DB (``test.seed``):
   1. Ordine OK (ORD-999-OK, stato Spedito) — path felice basso rischio
   2. Ordine smarrito (ORD-101-LOST) — Resolver deve usare i tool
   3. Prompt injection — Guardrail blocca prima di qualsiasi agente LLM

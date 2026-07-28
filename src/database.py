@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 # AGGIORNAMENTO: Importiamo i percorsi centralizzati e la funzione di utility
 from src.paths import DB_PATH, ensure_directories_exist
+from test.seed import seed_db
 
 # =====================================================================
 # DEFINIZIONE DELLE QUERY DI CREAZIONE TABELLE
@@ -85,113 +86,6 @@ SQL_CREATE_POLICY_CHUNKS_HASH_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_policy_chunks_hash ON policy_chunks(policy_hash);
 """
 
-# =====================================================================
-# FUNZIONI DI SEEDING (DATI DI TEST INIZIALI)
-# =====================================================================
-
-def seed_db(conn: sqlite3.Connection) -> None:
-    """
-    Popola il database con dati di test realistici per coprire tutti gli
-    scenari previsti dal PDF (standard, smarriti, rimborsi alti/bassi).
-    """
-    cursor = conn.cursor()
-
-    # Scenario 1: Lista di ordini di test
-    # Peculiarità Python: Usiamo una lista di tuple. Il metodo cursor.executemany() 
-    # è estremamente efficiente in Python per eseguire la stessa query SQL 
-    # su un intero iterabile di parametri in un solo colpo (batching).
-    ordini_test = [
-        # (id_ordine, email_cliente, importo, stato_spedizione)
-        ("ORD-999-OK", "mario.rossi@example.com", 45.50, "Spedito"),
-        ("ORD-101-LOST", "luca.bianchi@example.com", 89.90, "Smarrito"),
-        ("ORD-302-REFUND-LOW", "giulia.verdi@example.com", 35.00, "In Elaborazione"),
-        ("ORD-404-REFUND-HIGH", "antonio.neri@example.com", 250.00, "In Elaborazione")
-    ]
-
-    # Peculiarità Python/SQL: Usiamo 'INSERT OR IGNORE' per evitare che l'esecuzione 
-    # del bootstrap fallisca con un 'IntegrityError' (chiave primaria duplicata) 
-    # se avviamo il main più di una volta.
-    sql_insert_ordine = """
-    INSERT OR IGNORE INTO ordini (id_ordine, email_cliente, importo, stato_spedizione)
-    VALUES (?, ?, ?, ?);
-    """
-    cursor.executemany(sql_insert_ordine, ordini_test)
-
-    # Scenario 2: Record di pre-congelamento in workflow_states (Resume STEP 5).
-    # Stato esatto del breakpoint: assistant con tool_calls issue_refund, *senza*
-    # observation role=tool. Così ``resume_hitl_workflow`` può estrarre order_id/
-    # reason e completare il round OpenAI dopo l'approvazione supervisore.
-    id_sessione_test = "SESS-TEST-RESUME-01"
-
-    # Serializziamo con json.dumps (non stringa multilinea grezza): evita errori
-    # di escaping nelle arguments del function call e resta allineato a
-    # save_workflow_pending (stesso formato TEXT in messaggi_serializzati).
-    messaggi_seed_resume = [
-        {
-            "role": "system",
-            "content": (
-                "Sei il Customer Resolver di Autobahn Customer Care. "
-                "Usa i tool e chiudi con JSON finale."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Hand-off JSON dal Triage Analyst:\n"
-                '{"email_cliente": "antonio.neri@example.com", '
-                '"lingua": "it", "riassunto": "rimborso alto", '
-                '"id_ordine_sospetto": "ORD-404-REFUND-HIGH"}\n\n'
-                "Voglio il rimborso per l'ordine ORD-404-REFUND-HIGH, è rotto."
-            ),
-        },
-        {
-            "role": "assistant",
-            # content None: al freeze tipico l'LLM emette solo tool_calls.
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_seed_refund_404",
-                    "type": "function",
-                    "function": {
-                        "name": "issue_refund",
-                        # arguments come stringa JSON grezza (contratto Chat Completions).
-                        "arguments": json.dumps(
-                            {
-                                "order_id": "ORD-404-REFUND-HIGH",
-                                "reason": (
-                                    "prodotto difettoso — richiesta rimborso "
-                                    "oltre soglia HITL"
-                                ),
-                            },
-                            ensure_ascii=False,
-                        ),
-                    },
-                }
-            ],
-        },
-    ]
-    messaggi_finti_json = json.dumps(messaggi_seed_resume, ensure_ascii=False)
-
-    # INSERT OR REPLACE: se il seed precedente aveva messaggi senza tool_calls,
-    # al re-init allineiamo la cronologia al contratto resume (IGNORE lascerebbe
-    # la riga vecchia e --resume SESS-TEST-RESUME-01 fallirebbe).
-    sql_upsert_workflow = """
-    INSERT OR REPLACE INTO workflow_states (
-        id_sessione, email_cliente, id_ordine, stato_workflow, messaggi_serializzati
-    )
-    VALUES (?, ?, ?, ?, ?);
-    """
-    cursor.execute(sql_upsert_workflow, (
-        id_sessione_test,
-        "antonio.neri@example.com",
-        "ORD-404-REFUND-HIGH",
-        "PENDING_APPROVAL",
-        messaggi_finti_json,
-    ))
-
-    print("    [+] Dati di test (seed) inseriti con successo (o già esistenti).")
-
-    
 # =====================================================================
 # GESTIONE CONNESSIONE (Context Manager)
 # =====================================================================
@@ -612,7 +506,7 @@ def init_db() -> None:
         for query in queries:
             cursor.execute(query)
 
-        # AGGIORNAMENTO: Richiamiamo la funzione di seed all'interno della stessa transazione
+        # Seed demo: ``test/seed.py`` (ordini + workflow_states resume).
         seed_db(conn)
             
     print("Database inizializzato con successo!")
