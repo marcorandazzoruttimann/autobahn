@@ -6,6 +6,7 @@ Scenari allineati al seed DB (``test.seed``):
   2. Ordine smarrito (ORD-101-LOST) — Resolver deve usare i tool
   3. Prompt injection — Guardrail blocca prima di qualsiasi agente LLM
   4. Rimborso alto (ORD-404-REFUND-HIGH, 250€) — freeze HITL / PENDING_APPROVAL
+  5. Rimborso sotto soglia (ORD-302-REFUND-LOW, 35€) — ``issue_refund`` immediato + ``final_response``
 
 Resume: ``python -m src.main --resume SESS-TEST-RESUME-01`` riprende il
 workflow seed (o una sessione congelata da scenario 4) senza rilanciare
@@ -72,6 +73,21 @@ Grazie,
 Antonio Neri
 """
 
+# Scenario 5: rimborso sotto soglia HITL (35€ ≤ 100€) — stesso flusso A2 dello 4,
+# ma _esegui_tool_resolver esegue issue_refund subito: niente workflow_states,
+# ticket chiuso con insert_final_response (nessun --resume necessario).
+# Mittente/id allineati al seed ORD-302-REFUND-LOW / giulia.verdi@example.com.
+EMAIL_RIMBORSO_BASSO = """\
+From: giulia.verdi@example.com
+Subject: Richiesta rimborso ORD-302-REFUND-LOW
+
+Buongiorno,
+il prodotto dell'ordine ORD-302-REFUND-LOW è arrivato difettoso.
+Chiedo il rimborso completo secondo le vostre policy di supporto.
+Grazie,
+Giulia Verdi
+"""
+
 
 # Lista ordinata: la demo stampa un separatore per scenario e chiama
 # sempre la stessa ``elabora_email`` (pipeline lineare identica).
@@ -82,6 +98,10 @@ _SCENARI_DEMO: list[tuple[str, str]] = [
     (
         "4 — Rimborso alto HITL (ORD-404-REFUND-HIGH / 250€)",
         EMAIL_RIMBORSO_ALTO,
+    ),
+    (
+        "5 — Rimborso sotto soglia (ORD-302-REFUND-LOW / 35€)",
+        EMAIL_RIMBORSO_BASSO,
     ),
 ]
 
